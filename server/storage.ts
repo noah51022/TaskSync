@@ -7,8 +7,11 @@ export interface IStorage {
   // User operations
   getUser(id: number): Promise<User | undefined>;
   getUserByUsername(username: string): Promise<User | undefined>;
+  getUserByEmail(email: string): Promise<User | undefined>;
+  getUserByGoogleId(googleId: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
   updateUserPoints(userId: number, points: number): Promise<void>;
+  updateUserGoogleId(userId: number, googleId: string): Promise<void>;
 
   // Project operations
   createProject(project: InsertProject & { creatorId: number }): Promise<Project>;
@@ -35,6 +38,16 @@ export class DatabaseStorage implements IStorage {
     return user;
   }
 
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user;
+  }
+
+  async getUserByGoogleId(googleId: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.googleId, googleId));
+    return user;
+  }
+
   async createUser(insertUser: InsertUser): Promise<User> {
     const [user] = await db.insert(users).values(insertUser).returning();
     return user;
@@ -45,6 +58,12 @@ export class DatabaseStorage implements IStorage {
     if (!user) throw new Error("User not found");
     await db.update(users)
       .set({ points: user.points + points })
+      .where(eq(users.id, userId));
+  }
+
+  async updateUserGoogleId(userId: number, googleId: string): Promise<void> {
+    await db.update(users)
+      .set({ googleId })
       .where(eq(users.id, userId));
   }
 

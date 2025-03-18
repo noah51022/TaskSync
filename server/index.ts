@@ -1,11 +1,32 @@
 import express, { type Request, Response, NextFunction } from "express";
 import 'dotenv/config';
+import session from 'express-session';
+import passport from 'passport';
+import { setupAuth } from './services/auth';
+import * as apiRoutes from './routes';
+import authRoutes from './routes/auth';
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// Set up sessions
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'your-secret-key',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 1000 * 60 * 60 * 24 * 7 // 1 week
+  }
+}));
+
+// Initialize Passport and restore authentication state from session
+setupAuth();
+app.use(passport.initialize());
+app.use(passport.session());
 
 app.use((req, res, next) => {
   const start = Date.now();
@@ -20,7 +41,7 @@ app.use((req, res, next) => {
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
+    if (path.startsWith("/api") || path.startsWith("/auth")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
@@ -36,6 +57,9 @@ app.use((req, res, next) => {
 
   next();
 });
+
+// Authentication routes
+app.use('/auth', authRoutes);
 
 (async () => {
   const server = await registerRoutes(app);

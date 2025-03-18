@@ -7,9 +7,13 @@ var __export = (target, all) => {
 // server/index.ts
 import express2 from "express";
 import "dotenv/config";
+import session from "express-session";
+import passport3 from "passport";
 
-// server/routes.ts
-import { createServer } from "http";
+// server/services/auth.ts
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 
 // shared/schema.ts
 var schema_exports = {};
@@ -27,8 +31,12 @@ import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 var users = pgTable("users", {
   id: serial("id").primaryKey(),
-  username: text("username").notNull().unique(),
-  password: text("password").notNull(),
+  username: text("username").notNull(),
+  email: text("email").notNull().unique(),
+  password: text("password"),
+  googleId: text("google_id").unique(),
+  displayName: text("display_name"),
+  avatarUrl: text("avatar_url"),
   points: integer("points").notNull().default(0)
 });
 var projects = pgTable("projects", {
@@ -55,7 +63,18 @@ var projectMembers = pgTable("project_members", {
 });
 var insertUserSchema = createInsertSchema(users).pick({
   username: true,
-  password: true
+  email: true,
+  password: true,
+  googleId: true,
+  displayName: true,
+  avatarUrl: true
+}).extend({
+  username: z.string().min(3, "Username must be at least 3 characters"),
+  email: z.string().email("Invalid email address"),
+  password: z.string().min(6, "Password must be at least 6 characters").optional(),
+  googleId: z.string().optional(),
+  displayName: z.string().optional(),
+  avatarUrl: z.string().optional()
 });
 var insertProjectSchema = createInsertSchema(projects).pick({
   name: true,
@@ -99,6 +118,14 @@ var DatabaseStorage = class {
     const [user] = await db.select().from(users).where(eq(users.username, username));
     return user;
   }
+  async getUserByEmail(email) {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user;
+  }
+  async getUserByGoogleId(googleId) {
+    const [user] = await db.select().from(users).where(eq(users.googleId, googleId));
+    return user;
+  }
   async createUser(insertUser) {
     const [user] = await db.insert(users).values(insertUser).returning();
     return user;
@@ -107,6 +134,9 @@ var DatabaseStorage = class {
     const user = await this.getUser(userId);
     if (!user) throw new Error("User not found");
     await db.update(users).set({ points: user.points + points }).where(eq(users.id, userId));
+  }
+  async updateUserGoogleId(userId, googleId) {
+    await db.update(users).set({ googleId }).where(eq(users.id, userId));
   }
   async createProject(project) {
     const [newProject] = await db.insert(projects).values(project).returning();
@@ -145,7 +175,159 @@ var DatabaseStorage = class {
 };
 var storage = new DatabaseStorage();
 
+// server/services/auth.ts
+import bcrypt from "bcryptjs";
+function setupAuth() {
+  passport.serializeUser((user, done) => {
+    done(null, user.id);
+  });
+  passport.deserializeUser(async (id, done) => {
+    try {
+      const user = await storage.getUser(id);
+      done(null, user);
+    } catch (err) {
+      done(err);
+    }
+  });
+  passport.use(new LocalStrategy({
+    usernameField: "email",
+    passwordField: "password"
+  }, async (email, password, done) => {
+    try {
+      const user = await storage.getUserByEmail(email);
+      if (!user) {
+        return done(null, false, { message: "Incorrect email or password" });
+      }
+      if (!user.password) {
+        return done(null, false, { message: "This account uses Google authentication" });
+      }
+      const isMatch = await bcrypt.compare(password, user.password);
+      if (!isMatch) {
+        return done(null, false, { message: "Incorrect email or password" });
+      }
+      return done(null, user);
+    } catch (err) {
+      return done(err);
+    }
+  }));
+  passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID || "",
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
+    callbackURL: "/auth/google/callback",
+    scope: ["profile", "email"]
+  }, async (accessToken, refreshToken, profile, done) => {
+    try {
+      let user = await storage.getUserByGoogleId(profile.id);
+      if (user) {
+        return done(null, user);
+      }
+      const email = profile.emails?.[0]?.value;
+      if (!email) {
+        return done(new Error("No email found in Google profile"));
+      }
+      user = await storage.getUserByEmail(email);
+      if (user) {
+        await storage.updateUserGoogleId(user.id, profile.id);
+        return done(null, user);
+      }
+      const newUser = await storage.createUser({
+        username: profile.displayName.replace(/\s+/g, "_").toLowerCase() || `user_${Date.now()}`,
+        email,
+        googleId: profile.id,
+        displayName: profile.displayName,
+        avatarUrl: profile.photos?.[0]?.value
+      });
+      return done(null, newUser);
+    } catch (err) {
+      return done(err);
+    }
+  }));
+  return passport;
+}
+
+// server/routes/auth.ts
+import { Router } from "express";
+import passport2 from "passport";
+import bcrypt2 from "bcryptjs";
+var router = Router();
+router.post("/register", async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    const existingUser = await storage.getUserByEmail(email);
+    if (existingUser) {
+      return res.status(400).json({ error: "Email already in use" });
+    }
+    const salt = await bcrypt2.genSalt(10);
+    const hashedPassword = await bcrypt2.hash(password, salt);
+    const user = await storage.createUser({
+      username,
+      email,
+      password: hashedPassword
+    });
+    req.login(user, (err) => {
+      if (err) {
+        return res.status(500).json({ error: "Failed to login after registration" });
+      }
+      return res.json({ user: { id: user.id, username: user.username, email: user.email } });
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Registration failed" });
+  }
+});
+router.post("/login", (req, res, next) => {
+  passport2.authenticate("local", (err, user, info) => {
+    if (err) {
+      return next(err);
+    }
+    if (!user) {
+      return res.status(401).json({ error: info?.message || "Authentication failed" });
+    }
+    req.login(user, (err2) => {
+      if (err2) {
+        return next(err2);
+      }
+      return res.json({ user: { id: user.id, username: user.username, email: user.email } });
+    });
+  })(req, res, next);
+});
+router.get(
+  "/google",
+  passport2.authenticate("google", { scope: ["profile", "email"] })
+);
+router.get(
+  "/google/callback",
+  passport2.authenticate("google", { failureRedirect: "/login" }),
+  (req, res) => {
+    res.redirect("/");
+  }
+);
+router.get("/me", (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+  const user = req.user;
+  res.json({
+    user: {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      displayName: user.displayName,
+      avatarUrl: user.avatarUrl
+    }
+  });
+});
+router.post("/logout", (req, res) => {
+  req.logout((err) => {
+    if (err) {
+      return res.status(500).json({ error: "Logout failed" });
+    }
+    res.json({ success: true });
+  });
+});
+var auth_default = router;
+
 // server/routes.ts
+import { createServer } from "http";
 import { z as z2 } from "zod";
 async function registerRoutes(app2) {
   const httpServer = createServer(app2);
@@ -340,6 +522,19 @@ function serveStatic(app2) {
 var app = express2();
 app.use(express2.json());
 app.use(express2.urlencoded({ extended: false }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || "your-secret-key",
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 1e3 * 60 * 60 * 24 * 7
+    // 1 week
+  }
+}));
+setupAuth();
+app.use(passport3.initialize());
+app.use(passport3.session());
 app.use((req, res, next) => {
   const start = Date.now();
   const path3 = req.path;
@@ -351,7 +546,7 @@ app.use((req, res, next) => {
   };
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path3.startsWith("/api")) {
+    if (path3.startsWith("/api") || path3.startsWith("/auth")) {
       let logLine = `${req.method} ${path3} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
@@ -364,6 +559,7 @@ app.use((req, res, next) => {
   });
   next();
 });
+app.use("/auth", auth_default);
 (async () => {
   const server = await registerRoutes(app);
   app.use((err, _req, res, _next) => {

@@ -4,8 +4,12 @@ import { z } from "zod";
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
-  username: text("username").notNull().unique(),
-  password: text("password").notNull(),
+  username: text("username").notNull(),
+  email: text("email").notNull().unique(),
+  password: text("password"),
+  googleId: text("google_id").unique(),
+  displayName: text("display_name"),
+  avatarUrl: text("avatar_url"),
   points: integer("points").notNull().default(0),
 });
 
@@ -36,7 +40,18 @@ export const projectMembers = pgTable("project_members", {
 
 export const insertUserSchema = createInsertSchema(users).pick({
   username: true,
+  email: true,
   password: true,
+  googleId: true,
+  displayName: true,
+  avatarUrl: true,
+}).extend({
+  username: z.string().min(3, "Username must be at least 3 characters"),
+  email: z.string().email("Invalid email address"),
+  password: z.string().min(6, "Password must be at least 6 characters").optional(),
+  googleId: z.string().optional(),
+  displayName: z.string().optional(),
+  avatarUrl: z.string().optional(),
 });
 
 export const insertProjectSchema = createInsertSchema(projects).pick({
